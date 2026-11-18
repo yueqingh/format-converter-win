@@ -1,0 +1,22 @@
+﻿格式转换 v1.0.0 —— 第三方组件与许可
+==========================================
+
+本程序自己的代码供个人使用。它调用并随包附带了下列开源组件：
+
+1. FFmpeg（ffmpeg.exe、ffprobe.exe，位于 ffmpeg 文件夹）
+   许可：GNU GPL v2 或更高版本（本程序使用的是 BtbN 提供的 GPL 版本构建）
+   来源：https://ffmpeg.org  /  https://github.com/BtbN/FFmpeg-Builds
+   许可全文见 ffmpeg\FFMPEG-LICENSE.txt。
+   若你把本程序再分发给别人，需要同时提供 FFmpeg 的源码获取方式（见上述网址）。
+
+2. CustomTkinter（界面库）  MIT 许可
+   https://github.com/TomSchimansky/CustomTkinter
+
+3. tkinterdnd2（拖拽支持）  MIT 许可
+   https://github.com/Eliav2/tkinterdnd2
+
+4. Python 与 Tcl/Tk  PSF / Tcl 许可
+   https://www.python.org
+
+语音识别功能调用的是你自己已经部署好的 SenseVoice（FunASR）程序和模型，
+它们不包含在本程序内，各自的许可请见其项目主页。
