@@ -489,11 +489,13 @@ class FileRow(ctk.CTkFrame):
         self.status.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=(8, 0))
         self.bar = ctk.CTkProgressBar(self, height=6)
         self.bar.set(0)
+        self.pct_lbl = ctk.CTkLabel(self, text="", width=54, anchor="e", font=F(12, True), text_color=C_ACCENT)
         self.msg = ctk.CTkLabel(self, text="", anchor="w", justify="left", font=F(11), wraplength=420)
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.grid(row=0, column=3, rowspan=2, padx=(0, 8))
         self.btns = {}
         for key, text, w, cmd in (("open", "打开", 40, lambda: app.open_result(item)),
+                                  ("first", "先转", 40, lambda: app.run_first(item)),
                                   ("up", "↑", 28, lambda: app.move_item(item, -1)),
                                   ("down", "↓", 28, lambda: app.move_item(item, 1)),
                                   ("cfg", "设置", 44, lambda: app.edit_item_settings(item)),
@@ -503,6 +505,7 @@ class FileRow(ctk.CTkFrame):
             b.pack(side="left", padx=1)
             self.btns[key] = b
         self.btns["open"].pack_forget()
+        self.btns["first"].pack_forget()
         self._bar_mode = "determinate"
         self._bar_shown = False
         for w in (self, self.name, self.info, self.idx, self.status):
@@ -527,37 +530,58 @@ class FileRow(ctk.CTkFrame):
     def set_selected(self, on):
         self.configure(border_color=C_ACCENT if on else C_CARD_BORDER, border_width=2 if on else 1)
 
-    def set_locked(self, locked, merge=False):
-        st = "disabled" if locked else "normal"
+    def update_controls(self):
+        """按当前状态决定哪些按钮能点：转换中不能动正在转的文件，排队中的文件仍可调整。"""
+        a, it = self.app, self.item
+        merge = bool(a.merge_var.get())
+        busy = it.status == "转换中"
+        if a.running and (a.mode != "batch" or a.run_merge):
+            on_move = on_cfg = False
+        elif a.running:
+            on_move = not busy
+            on_cfg = (not busy) and it.probe is not None
+        else:
+            on_move = True
+            on_cfg = it.probe is not None and not merge
         for k in ("up", "down", "rm"):
-            self.btns[k].configure(state=st)
-        self.btns["cfg"].configure(state="disabled" if (locked or merge) else "normal")
+            self.btns[k].configure(state="normal" if on_move else "disabled")
+        self.btns["cfg"].configure(state="normal" if on_cfg else "disabled")
+        want_first = a.can_jump(it)
+        if want_first and not self.btns["first"].winfo_ismapped():
+            self.btns["first"].pack(side="left", padx=1, before=self.btns["up"])
+        elif not want_first and self.btns["first"].winfo_ismapped():
+            self.btns["first"].pack_forget()
 
     def show_bar(self, show):
         if show and not self._bar_shown:
             self.bar.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(6, 6), pady=(0, 8))
+            self.pct_lbl.grid(row=2, column=3, sticky="e", padx=(0, 10), pady=(0, 8))
             self._bar_shown = True
         elif not show and self._bar_shown:
             self.bar.grid_forget()
+            self.pct_lbl.grid_forget()
             if self._bar_mode == "indeterminate":
                 self.bar.stop()
                 self.bar.configure(mode="determinate")
                 self._bar_mode = "determinate"
             self._bar_shown = False
 
-    def set_progress(self, pct):
+    def set_progress(self, pct, approx=False):
         self.show_bar(True)
         if pct is None:
             if self._bar_mode != "indeterminate":
                 self.bar.configure(mode="indeterminate")
                 self.bar.start()
                 self._bar_mode = "indeterminate"
+            self.pct_lbl.configure(text="…")
         else:
             if self._bar_mode != "determinate":
                 self.bar.stop()
                 self.bar.configure(mode="determinate")
                 self._bar_mode = "determinate"
-            self.bar.set(max(0.0, min(1.0, pct / 100.0)))
+            v = max(0.0, min(100.0, float(pct)))
+            self.bar.set(v / 100.0)
+            self.pct_lbl.configure(text=("约 %d%%" if approx else "%d%%") % int(v))
 
     def refresh(self):
         it = self.item
@@ -568,9 +592,13 @@ class FileRow(ctk.CTkFrame):
         elif it.probe_error:
             self.info.configure(text="", text_color=C_ERR)
         st = it.status
-        self.status.configure(text={"探测中": "读取中…", "等待": "等待中"}.get(st, st), text_color=STATUS_COLORS.get(st, C_MUTED))
+        paused = st == "转换中" and self.app.item_paused(it)
+        if paused:
+            self.status.configure(text="已暂停", text_color=C_WARN)
+        else:
+            self.status.configure(text={"探测中": "读取中…", "等待": "等待中"}.get(st, st), text_color=STATUS_COLORS.get(st, C_MUTED))
         if st == "转换中":
-            self.set_progress(it.pct if it.pct is not None else None)
+            self.set_progress(it.pct if it.pct is not None else None, it.approx)
         elif st == "完成":
             self.set_progress(100)
             self.after(600, lambda: self.show_bar(False) if self.item.status == "完成" else None)
@@ -579,6 +607,8 @@ class FileRow(ctk.CTkFrame):
         text, color = "", C_MUTED
         if st in ("失败", "无法读取") and (it.message or it.probe_error):
             text, color = (it.message or it.probe_error), C_ERR
+        elif paused:
+            text, color = "已暂停 · 点下方“继续”接着转（暂停的时间不计入用时）", C_WARN
         elif st == "转换中" and it.message:
             text = it.message
         elif st == "完成":

@@ -13,7 +13,7 @@ import threading
 import traceback
 
 APP_NAME = "格式转换"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_DATE = "2026-11-18"
 
 RING_SIZE = 200

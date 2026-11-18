@@ -337,6 +337,169 @@ def run_selftest(workdir=None):
     except Exception as e:
         rep.add("错误提示", False, str(e))
 
+    # ---------- v1.1：文字整理 / 分段规划 / 防睡眠
+    try:
+        import textfix
+        raw = "<|zh|><|NEUTRAL|><|Speech|><|withitn|>這個軟體很好用。 你 好 世界！Hello world 還有嗎？"
+        t = textfix.clean_text(raw)
+        rep.add("识别文字整理：去标记、转简体、去多余空格、按句分行",
+                t.splitlines() == ["这个软体很好用。", "你好世界！", "Hello world 还有吗？"], repr(t))
+        t2 = textfix.clean_text("<|zh|>這個", simplified=False, tidy=False)
+        rep.add("关闭整理后保持原样", t2 == "<|zh|>這個", repr(t2))
+        sil = [(298, 300), (610, 611)]
+        ch = core.plan_chunks(1917, sil)
+        ok = (len(ch) == 6 and abs(ch[0][1] - 299) < 0.01 and abs(ch[1][1] - 610.5) < 0.01 and ch[-1][1] == 1917
+              and all(abs(ch[i][1] - ch[i + 1][0]) < 1e-9 for i in range(len(ch) - 1)))
+        rep.add("长音频分段：优先切在停顿处，首尾相接", ok, str([(round(a), round(b)) for a, b in ch]))
+        rep.add("短音频不分段", core.plan_chunks(300, []) == [(0.0, 300.0)], "")
+        import power
+        rep.add("防睡眠开关可调用", power.keep_awake(True) in (True, False) and power.keep_awake(False) in (True, False),
+                "Windows 上应为开启成功" if os.name == "nt" else "非 Windows 不执行")
+    except Exception as e:
+        rep.add("v1.1 基础功能", False, "%s\n%s" % (e, traceback.format_exc()[-400:]))
+
+    # ---------- v1.1：长音频分段识别、进度、续转（假的识别程序）
+    try:
+        longwav = os.path.join(src, "十分钟.wav")
+        sh([FF, "-y", "-f", "lavfi", "-i", "sine=frequency=300:sample_rate=16000:duration=600", "-ac", "1",
+            "-c:a", "pcm_s16le", longwav])
+        fake = make_fake_sv(tmp)
+        dummy = os.path.join(tmp, "model.gguf")
+        open(dummy, "wb").write(b"x")
+        it = runner.Item(longwav)
+        it.probe = probe(longwav)
+        events.clear()
+        ctx = mkctx(sv={"exe": fake, "model": dummy, "vad": ""})
+        runner.process_item(ctx, it, dict(target="txt"))
+        lines = open(it.out_paths[0], encoding="utf-8-sig").read().strip().splitlines()
+        rep.add("10 分钟音频自动分成 2 段识别并合并", len(lines) == 2, "%d 行" % len(lines))
+        prog = [e for e in events if e[0] == "progress"]
+        pcts = [e[2] for e in prog if e[2] is not None]
+        rep.add("识别过程有百分比和“估算”提示", bool(pcts) and max(pcts) <= 99.5 and any("估算" in e[3] for e in prog),
+                "%d 条进度，最高 %.0f%%" % (len(prog), max(pcts) if pcts else -1))
+        rep.add("识别完成后续转记录已清理", not os.path.isdir(ctx.resume_dir) or not os.listdir(ctx.resume_dir), "")
+        rep.add("识别速度已记住（下次估算更准）", os.path.isfile(ctx.speed_path) and 0.005 <= runner.load_rtf(ctx) <= 30, "%.3f" % runner.load_rtf(ctx))
+        if os.name != "nt":
+            flaky = os.path.join(tmp, "fake_flaky.sh")
+            with open(flaky, "w", encoding="utf-8") as f:
+                f.write('#!/bin/sh\nd=$(dirname "$0")\nn=$(cat "$d/cnt" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$d/cnt"\n'
+                        'for a; do last="$a"; done\n[ -f "$last" ] || exit 3\n'
+                        'if [ -f "$d/failflag" ] && [ "$n" = "2" ]; then exit 5; fi\necho "片段$n"\n')
+            os.chmod(flaky, 0o755)
+            for f in ("cnt", "failflag"):
+                try:
+                    os.remove(os.path.join(tmp, f))
+                except OSError:
+                    pass
+            open(os.path.join(tmp, "failflag"), "w").write("1")
+            it2 = runner.Item(longwav)
+            it2.probe = probe(longwav)
+            ctx2 = mkctx(sv={"exe": flaky, "model": dummy, "vad": ""})
+            try:
+                runner.process_item(ctx2, it2, dict(target="txt"))
+                rep.add("中途失败后保留已识别的段落", False, "没有报错")
+            except runner.RunError:
+                kept = [x for x in os.listdir(ctx2.resume_dir)] if os.path.isdir(ctx2.resume_dir) else []
+                has = any(os.path.isfile(os.path.join(ctx2.resume_dir, d, "c000.txt")) for d in kept)
+                rep.add("中途失败后保留已识别的段落", has, str(kept))
+            os.remove(os.path.join(tmp, "failflag"))
+            it3 = runner.Item(longwav)
+            it3.probe = probe(longwav)
+            runner.process_item(ctx2, it3, dict(target="txt"))
+            txt = open(it3.out_paths[0], encoding="utf-8-sig").read()
+            cnt = int(open(os.path.join(tmp, "cnt")).read().strip())
+            rep.add("再次转换时接着上次进度（跳过已完成的段）", "片段1" in txt and "片段3" in txt and cnt == 3 and
+                    any("接着" in n for n in it3.notes), "识别程序共运行 %d 次；%s" % (cnt, txt.strip().replace("\n", " / ")))
+        else:
+            rep.add("续转测试（仅在非 Windows 上运行）", True, "跳过")
+    except Exception as e:
+        rep.add("分段识别/续转", False, "%s\n%s" % (e, traceback.format_exc()[-600:]))
+
+    # ---------- v1.1：暂停 / 继续 / 暂停时取消
+    try:
+        it = runner.Item(M["long"])
+        it.probe = probe(M["long"])
+        ctx = mkctx()
+        events.clear()
+        res = {}
+
+        def work():
+            try:
+                runner.process_item(ctx, it, dict(target="mp4", v_codec="h265", v_speed="slow", v_res=0))
+                res["r"] = "完成"
+            except runner.Cancelled:
+                res["r"] = "已取消"
+            except Exception as e:
+                res["r"] = "异常 %s" % e
+        th = threading.Thread(target=work)
+        th.start()
+        time.sleep(1.0)
+        ctx.pause()
+        time.sleep(0.8)
+        n1 = len([e for e in events if e[0] == "progress"])
+        time.sleep(2.0)
+        n2 = len([e for e in events if e[0] == "progress"])
+        rep.add("暂停后转换真的停住（2 秒内没有新进度）", n2 == n1 and th.is_alive(), "暂停后进度条数 %d → %d" % (n1, n2))
+        ctx.resume()
+        th.join(60)
+        rep.add("继续后能转完", res.get("r") == "完成" and os.path.isfile(it.out_paths[0]), str(res.get("r")))
+        # 暂停时取消
+        it = runner.Item(M["long"])
+        it.probe = probe(M["long"])
+        ctx = mkctx()
+        res = {}
+        th = threading.Thread(target=lambda: _try(lambda: runner.process_item(
+            ctx, it, dict(target="mp4", v_codec="h265", v_speed="slow", v_res=0)), res))
+        th.start()
+        time.sleep(1.0)
+        ctx.pause()
+        time.sleep(0.6)
+        t0 = time.time()
+        ctx.request_cancel()
+        th.join(15)
+        rep.add("暂停状态下点取消能立即结束", res.get("r") == "Cancelled" and time.time() - t0 < 8,
+                "%s，%.1f 秒" % (res.get("r"), time.time() - t0))
+    except Exception as e:
+        rep.add("暂停/继续", False, "%s\n%s" % (e, traceback.format_exc()[-500:]))
+
+    # ---------- v1.1：完成后暂停、先转某个文件、转换中追加文件
+    try:
+        files = [M["mp3"], M["wav51"], M["lr"]]
+        its = []
+        for pth in files:
+            x = runner.Item(pth)
+            x.probe = probe(pth)
+            x.status, x.in_batch = "等待", True
+            its.append(x)
+        ctx = mkctx()
+        events.clear()
+        ctx.pause_after = True
+        sf = lambda i: dict(target="wav")
+        done_order = []
+        th = threading.Thread(target=runner.run_batch, args=(ctx, its, sf))
+        th.start()
+        t_end = time.time() + 20
+        while time.time() < t_end and not ctx.paused:
+            time.sleep(0.1)
+        rep.add("“当前文件完成后暂停”生效", ctx.paused and its[0].status == "完成" and its[1].status == "等待",
+                "暂停=%s，状态=%s" % (ctx.paused, [i.status for i in its]))
+        extra = runner.Item(M["mp3"])
+        extra.probe = probe(M["mp3"])
+        extra.status, extra.in_batch, extra.snap = "等待", True, dict(target="flac")
+        with ctx.lock:
+            its.append(extra)
+        ok_jump = runner.start_jump(ctx, its[2], sf)
+        th.join(60)
+        order = [e[1].name for e in events if e[0] == "status" and e[2] == "完成"]
+        want = [os.path.basename(its[0].path), os.path.basename(its[2].path)]
+        rep.add("暂停期间“先转这个”，转完自动继续其余", ok_jump and order[:2] == want and all(i.status == "完成" for i in its),
+                "完成顺序 %s；状态 %s" % (order, [i.status for i in its]))
+        rep.add("转换中追加的文件也被转换", extra.status == "完成" and extra.out_paths, extra.status)
+        est = runner.estimate_remaining(ctx, its, sf)
+        rep.add("剩余时间估算函数可用（全部完成时为 0）", est == 0.0, str(est))
+    except Exception as e:
+        rep.add("完成后暂停/先转/追加", False, "%s\n%s" % (e, traceback.format_exc()[-600:]))
+
     # ---------- 诊断层
     try:
         t = diag.redact("联系 a.b@qq.com 手机 13812345678 token=abcdef C:\\Users\\张三\\Desktop 密钥 " + "A1" * 25)
@@ -375,6 +538,16 @@ def _freq(wav_path):
         return 0.0
     cross = sum(1 for i in range(1, len(vals)) if (vals[i - 1] < 0) != (vals[i] < 0))
     return cross / 2.0 / (n / float(rate))
+
+
+def _try(fn, res):
+    try:
+        fn()
+        res["r"] = "完成"
+    except runner.Cancelled:
+        res["r"] = "Cancelled"
+    except Exception as e:
+        res["r"] = "异常 %s" % e
 
 
 def _prep(path):

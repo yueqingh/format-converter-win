@@ -1,0 +1,47 @@
+﻿格式转换 v1.1.0 —— 怎么拿到 exe（更新时：把里面所有文件覆盖上传即可）
+================================================================
+
+原理：把这个压缩包里的文件上传到你的 GitHub 仓库，GitHub 会自动在云端的 Windows 上打包，
+几分钟后你在仓库的 Releases 页面下载 zip，解压就能用。你的电脑不用装任何开发工具。
+
+【第 1 步：新建仓库】
+1. 登录 GitHub，右上角“+”→ New repository。
+2. 仓库名填 format-converter-win，选 Public 或 Private 都可以，点 Create repository。
+
+【第 2 步：上传文件】（任选一种）
+
+方式 A：命令行（电脑装了 git 的话更省事）
+   先把本压缩包解压，然后打开 PowerShell，依次执行（把“你的用户名”换成你的）：
+
+   git clone https://github.com/你的用户名/format-converter-win.git
+   cd format-converter-win
+   （把解压出来的所有文件复制进这个文件夹，包括 .github 文件夹）
+   git add -A
+   git commit -m "v1.1.0"
+   git push
+
+方式 B：网页上传
+   1. 解压本压缩包。
+   2. 打开你的仓库页面，点 “uploading an existing file”（或 Add file → Upload files）。
+   3. 打开解压后的文件夹，按 Ctrl+A 全选，整体拖进浏览器页面。
+      一定要包含 .github 文件夹（里面是自动打包的设置）。
+   4. 等上传完，点最下面的 Commit changes。
+
+【第 3 步：等待打包】
+1. 打开仓库页面顶部的 Actions 标签，会看到一个正在运行的 build-windows（黄色圆点）。
+2. 大约 5～10 分钟后变成绿色对勾，就打包完成了。
+   如果是红色叉，点进去，把页面里的报错文字发给我。
+
+【第 4 步：下载】
+1. 回到仓库首页，右侧点 Releases → 点最新的 FormatConverter。
+2. 下载 FormatConverter-v1.1.0-win64.zip（约 100～200 MB），解压后双击 FormatConverter.exe。
+3. 同一个页面里还有 selftest_result.txt，是在 Windows 上自动做的功能自检结果，出问题时一并发给我。
+
+【这次是更新（v1.0.0 → v1.1.0）】
+仓库已经建好的话，只做“第 2 步”：把解压出来的所有文件覆盖上传（新增了 textfix.py、zh_t2s.py、power.py 三个文件，
+改动了 core.py、diag.py、runner.py、ui.py、ui_widgets.py、selftest.py、README.txt、NOTICE.txt）。
+.github 文件夹你之前已经补过，不用再动。上传后到 Actions 里等绿色对勾，再去 Releases 下载新版。
+
+【以后更新】
+我给你新版本的压缩包后，重复第 2 步（覆盖上传）即可，GitHub 会自动重新打包，
+下载位置不变（Releases 里的 latest 会被新版替换）。

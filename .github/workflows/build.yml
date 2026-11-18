@@ -1,5 +1,8 @@
 name: build-windows
 
+# 把本仓库的文件上传到 GitHub 后，会自动在云端的 Windows 上打包出 exe。
+# 完成后到仓库右侧的 “Releases” 里下载 zip。
+
 on:
   push:
     branches: [main, master]

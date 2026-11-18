@@ -790,6 +790,60 @@ def plan_asr_wav(ff, p, s, out_wav, limit=None):
     return plan_audio(ff, p, asr_settings(s), out_wav, limit)
 
 
+# ---------------------------------------------------------------- 长音频分段识别
+CHUNK_TARGET = 300.0       # 每段约 5 分钟
+CHUNK_MIN_TOTAL = 480.0    # 短于 8 分钟不分段
+
+
+def parse_silencedetect(text):
+    """解析 ffmpeg silencedetect 的输出，返回 [(开始秒, 结束秒)]。"""
+    import re
+    out, start = [], None
+    for line in text.splitlines():
+        m = re.search(r"silence_start:\s*(-?[0-9.]+)", line)
+        if m:
+            try:
+                start = max(0.0, float(m.group(1)))
+            except ValueError:
+                start = None
+            continue
+        m = re.search(r"silence_end:\s*(-?[0-9.]+)", line)
+        if m and start is not None:
+            try:
+                out.append((start, float(m.group(1))))
+            except ValueError:
+                pass
+            start = None
+    return out
+
+
+def plan_chunks(total, silences, target=CHUNK_TARGET, min_total=CHUNK_MIN_TOTAL):
+    """把总长 total 秒的音频切成约 target 秒一段，尽量切在停顿的中点；返回 [(开始, 结束)]。"""
+    if not total or total <= 0:
+        return []
+    if total < min_total:
+        return [(0.0, float(total))]
+    mids = sorted((a + b) / 2.0 for a, b in (silences or []) if b > a)
+    cuts, pos = [], 0.0
+    while total - pos > target * 1.7:
+        ideal = pos + target
+        lo, hi = pos + target * 0.6, pos + target * 1.4
+        cand = [m for m in mids if lo <= m <= hi]
+        cut = min(cand, key=lambda m: abs(m - ideal)) if cand else ideal
+        cuts.append(cut)
+        pos = cut
+    edges = [0.0] + cuts + [float(total)]
+    return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+
+
+def resume_key(path, size, mtime, extra):
+    """续转用的标识：同一个文件、同样的设置才能接着上次的进度。"""
+    import hashlib
+    h = hashlib.sha1()
+    h.update(("%s|%s|%s|%s" % (os.path.normcase(os.path.abspath(path)), size, int(mtime), extra)).encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
 def srt_tracks(p, s):
     """返回要导出的 [(序号, Stream)]。"""
     s = norm(s)

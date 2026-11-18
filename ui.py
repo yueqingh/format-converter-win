@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """主界面。"""
+import contextlib
+import datetime
 import json
 import os
 import queue
@@ -14,6 +16,7 @@ import customtkinter as ctk
 
 import core
 import diag
+import power
 import runner
 from ui_widgets import (C_ACCENT, C_ACCENT_HOVER, C_CARD, C_CARD_BORDER, C_ERR, C_MUTED, C_OK, C_PANEL, C_WARN,
                         C_WARN_HOVER, F, FM, FileRow, Opt, SettingsPanel, TextDialog, center_on, chk_style, ellipsize)
@@ -90,7 +93,12 @@ class App:
         self.running = False
         self.mode = ""            # batch / trial
         self.ctx = None
-        self.batch_items = []
+        self.run_merge = False
+        self.run_snap = None
+        self.jump_item = None
+        self.sched_at = None
+        self._sched_job = None
+        self._queue_job = None
         self.last_outs = []
         self._cfg_job = None
         self._toast_job = None
@@ -112,6 +120,7 @@ class App:
         diag.add_provider("当前状态", self._state_text)
         diag.add_provider("设置快照", self._config_text)
         diag.add_provider("文件列表", self._items_text)
+        diag.add_provider("运行细节（暂停/排队/识别速度）", self._run_text)
 
         self.probe_q = queue.Queue()
         threading.Thread(target=self._probe_loop, daemon=True, name="探测线程").start()
@@ -124,6 +133,7 @@ class App:
             self.banner.configure(text="⚠ 找不到转换引擎（ffmpeg）。请确认程序文件夹里的 ffmpeg 文件夹没有被删除或被杀毒软件隔离。")
             self.banner.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 6))
         diag.trail("程序启动")
+        self._restore_queue()
         log.info("ffmpeg=%s ffprobe=%s 拖拽=%s", diag.redact(str(self.ffmpeg)), diag.redact(str(self.ffprobe)),
                  getattr(self.root, "dnd_ok", False))
 
@@ -146,7 +156,8 @@ class App:
     # ------------------------------------------------------------ 配置
     def _load_cfg(self):
         d = {"settings": core.norm(None), "user_presets": {}, "out_mode": "folder", "out_custom": "",
-             "low_priority": True, "open_after": True, "sv": {"exe": "", "model": "", "vad": ""}, "adv_open": False}
+             "low_priority": True, "open_after": True, "sv": {"exe": "", "model": "", "vad": ""}, "adv_open": False,
+             "asr_simplified": True, "asr_tidy": True, "asr_split": True}
         try:
             with open(self.cfg_path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
@@ -181,6 +192,7 @@ class App:
         try:
             import shutil
             shutil.rmtree(os.path.join(self.tmp_dir, "trial"), ignore_errors=True)
+            runner.clean_resume(self.data_dir)
             for f in os.listdir(self.tmp_dir):
                 p = os.path.join(self.tmp_dir, f)
                 if os.path.isfile(p):
@@ -238,19 +250,26 @@ class App:
         bottom = ctk.CTkFrame(r, fg_color="transparent")
         bottom.grid(row=3, column=0, sticky="ew", padx=18, pady=(10, 14))
         bottom.grid_columnconfigure(1, weight=1)
-        self.sum_lbl = ctk.CTkLabel(bottom, text="", anchor="w", font=F(12), text_color=C_MUTED, width=220)
+        self.sum_lbl = ctk.CTkLabel(bottom, text="", anchor="w", font=F(12), text_color=C_MUTED, width=330)
         self.sum_lbl.grid(row=0, column=0, sticky="w")
         self.total_bar = ctk.CTkProgressBar(bottom, height=8)
         self.total_bar.set(0)
         self.total_bar.grid(row=0, column=1, sticky="ew", padx=14)
-        self.trial_btn = ctk.CTkButton(bottom, text="试转前 30 秒", width=110, height=38, font=F(13), fg_color="transparent",
-                                       border_width=1, text_color=("gray20", "gray85"), border_color=C_CARD_BORDER,
-                                       command=self.trial)
-        self.trial_btn.grid(row=0, column=2, padx=(0, 8))
-        self.start_btn = ctk.CTkButton(bottom, text="开始转换", width=140, height=38, font=F(14, True), fg_color=C_ACCENT,
+        outline = dict(fg_color="transparent", border_width=1, text_color=("gray20", "gray85"), border_color=C_CARD_BORDER)
+        self.sched_btn = ctk.CTkButton(bottom, text="定时开始", width=92, height=38, font=F(13), command=self.sched_clicked, **outline)
+        self.sched_btn.grid(row=0, column=2, padx=(0, 8))
+        self.trial_btn = ctk.CTkButton(bottom, text="试转前 30 秒", width=110, height=38, font=F(13), command=self.trial, **outline)
+        self.trial_btn.grid(row=0, column=3, padx=(0, 8))
+        self.start_btn = ctk.CTkButton(bottom, text="开始转换", width=130, height=38, font=F(14, True), fg_color=C_ACCENT,
                                        hover_color=C_ACCENT_HOVER, command=self.start)
-        self.start_btn.grid(row=0, column=3)
-        self.cancel_btn = ctk.CTkButton(bottom, text="取消", width=140, height=38, font=F(14, True), fg_color=C_ERR,
+        self.start_btn.grid(row=0, column=4)
+        # 转换中才出现的控件
+        self.pause_after_var = tk.BooleanVar(value=False)
+        self.pause_after_chk = ctk.CTkCheckBox(bottom, text="当前文件完成后暂停", variable=self.pause_after_var,
+                                               command=self.pause_after_toggled, **chk_style())
+        self.pause_btn = ctk.CTkButton(bottom, text="暂停", width=92, height=38, font=F(14, True), fg_color=C_WARN,
+                                       hover_color=C_WARN_HOVER, command=self.toggle_pause)
+        self.cancel_btn = ctk.CTkButton(bottom, text="取消", width=110, height=38, font=F(14, True), fg_color=C_ERR,
                                         hover_color=("#b91c1c", "#dc2626"), command=self.cancel)
         self._refresh_summary()
 
@@ -310,6 +329,16 @@ class App:
                                ("完成后自动打开保存文件夹", self.open_var, "open_after"),
                                ("全部完成后自动关机", self.shut_var, None)):
             ctk.CTkCheckBox(opts, text=text, variable=var, command=lambda v=var, k=key, t=text: self._opt_toggled(v, k, t),
+                            **chk_style()).pack(anchor="w", pady=(7, 0))
+        asr = ctk.CTkFrame(right, fg_color="transparent")
+        asr.pack(fill="x", padx=12, pady=(0, 14))
+        ctk.CTkLabel(asr, text="语音转文字的结果", anchor="w", font=F(13, True)).pack(fill="x")
+        self.asr_vars = {}
+        for text, key in (("转为简体中文", "asr_simplified"), ("去掉识别标记、整理多余空格", "asr_tidy"),
+                          ("按句分行（遇到。！？换行）", "asr_split")):
+            var = tk.BooleanVar(value=bool(self.cfg.get(key, True)))
+            self.asr_vars[key] = var
+            ctk.CTkCheckBox(asr, text=text, variable=var, command=lambda v=var, k=key, t=text: self._opt_toggled(v, k, t),
                             **chk_style()).pack(anchor="w", pady=(7, 0))
 
     def _setup_dnd(self):
@@ -387,9 +416,15 @@ class App:
         if d:
             self.add_paths([d])
 
+    def _mut(self):
+        """转换进行中修改文件列表时，和后台线程互斥。"""
+        if self.ctx is not None and self.running:
+            return self.ctx.lock
+        return contextlib.nullcontext()
+
     def add_paths(self, paths):
-        if self.running:
-            self.toast("正在转换，暂时不能添加文件", color=C_WARN)
+        if self.running and self.mode == "batch" and self.run_merge:
+            self.toast("正在合并，合并过程中不能添加文件", color=C_WARN)
             return
         existing = {os.path.normcase(os.path.abspath(i.path)) for i in self.items}
         new, skipped_dup, skipped_limit = [], 0, 0
@@ -413,13 +448,22 @@ class App:
                 continue
             existing.add(key)
             new.append(p)
+        live = self.running and self.mode == "batch"
+        snap = core.norm(self.panel.get()) if live else None
         for p in new:
             it = runner.Item(p)
-            self.items.append(it)
+            if live:
+                it.in_batch, it.snap = True, snap      # 转换中途添加：用添加这一刻的设置，排在队尾自动转
+            with self._mut():
+                self.items.append(it)
             self._make_row(it)
             self.probe_q.put(it)
         self._regrid()
+        self.save_queue_soon()
         msg = "已添加 %d 个文件" % len(new)
+        if live and new:
+            msg += "，已排在队尾，前面的转完会自动接着转"
+            diag.trail("转换中追加 %d 个文件" % len(new))
         if skipped_dup:
             msg += "，跳过 %d 个重复" % skipped_dup
         if skipped_limit:
@@ -440,7 +484,7 @@ class App:
             row = self.rows[it.id]
             row.set_index(i)
             row.pack(fill="x", pady=4, padx=(0, 4))
-            row.set_locked(self.running, self.merge_var.get())
+            row.update_controls()
             row.set_selected(self.selected == it.id)
         if not self.items:
             self.empty_lbl.pack(pady=60)
@@ -454,21 +498,31 @@ class App:
 
     def move_item(self, it, d):
         diag.trail("移动文件 %+d：%s" % (d, it.name))
-        i = self.items.index(it)
-        j = i + d
-        if 0 <= j < len(self.items):
-            self.items[i], self.items[j] = self.items[j], self.items[i]
-            self._regrid()
+        with self._mut():
+            i = self.items.index(it)
+            j = i + d
+            if 0 <= j < len(self.items):
+                self.items[i], self.items[j] = self.items[j], self.items[i]
+        self._regrid()
+        self.save_queue_soon()
 
     def remove_item(self, it):
         diag.trail("移除文件：%s" % it.name)
-        self.items.remove(it)
+        with self._mut():
+            if self.running and it.status == "转换中":
+                self.toast("这个文件正在转换，请先点“取消”再移除", color=C_WARN)
+                return
+            self.items.remove(it)
+            it.in_batch = False
         row = self.rows.pop(it.id, None)
         if row:
             row.destroy()
         if self.selected == it.id:
             self.selected = None
         self._regrid()
+        self.save_queue_soon()
+        if self.running:
+            self._update_total()
 
     def clear_items(self):
         if self.running:
@@ -482,12 +536,69 @@ class App:
         self.selected = None
         self.total_bar.set(0)
         self._regrid()
+        self.save_queue_soon()
 
     def _merge_toggled(self):
         diag.trail("合并开关：%s" % self.merge_var.get())
         for it in self.items:
-            self.rows[it.id].set_locked(self.running, self.merge_var.get())
+            self.rows[it.id].update_controls()
         self._refresh_summary()
+
+    # ------------------------------------------------------------ 队列保存与恢复
+    def save_queue_soon(self):
+        if self._queue_job:
+            try:
+                self.root.after_cancel(self._queue_job)
+            except Exception:
+                pass
+        self._queue_job = self.root.after(800, self._save_queue)
+
+    def _save_queue(self):
+        self._queue_job = None
+        try:
+            keep = [{"path": i.path, "settings": i.settings} for i in self.items
+                    if i.status in ("等待", "转换中", "已取消", "失败", "探测中")]
+            p = os.path.join(self.data_dir, "queue.json")
+            if not keep:
+                if os.path.exists(p):
+                    os.remove(p)
+                return
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(keep, f, ensure_ascii=False)
+            os.replace(tmp, p)
+        except Exception as e:
+            log.warning("保存待转换队列失败：%s", e)
+
+    def _restore_queue(self):
+        p = os.path.join(self.data_dir, "queue.json")
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            log.warning("读取待转换队列失败：%s", e)
+            return
+        n = 0
+        for e in saved[:MAX_FILES]:
+            try:
+                path = e.get("path")
+                if not path or not os.path.isfile(path):
+                    continue
+                it = runner.Item(path)
+                it.settings = e.get("settings") or None
+                self.items.append(it)
+                self._make_row(it)
+                self.probe_q.put(it)
+                n += 1
+            except Exception:
+                continue
+        if n:
+            self._regrid()
+            self.toast("已恢复上次没转完的 %d 个文件，点“开始转换”继续" % n, 9000)
+            diag.trail("恢复队列 %d 个文件" % n)
+            log.info("恢复队列：%d 个文件", n)
 
     # ------------------------------------------------------------ 探测
     def _probe_loop(self):
@@ -535,6 +646,8 @@ class App:
     def settings_for(self, it, snap):
         if it.settings:
             return core.norm(it.settings)
+        if it.snap:
+            return core.norm(it.snap)
         return core.norm(snap)
 
     def preview_text(self, it, s):
@@ -574,7 +687,7 @@ class App:
         return self.preview_text(self.current_item(), s)
 
     def edit_item_settings(self, it):
-        if self.running or it.probe is None:
+        if it.probe is None or (self.running and (self.mode != "batch" or self.run_merge or it.status == "转换中")):
             return
         diag.trail("打开单独设置：%s" % it.name)
         dlg = ctk.CTkToplevel(self.root)
@@ -785,38 +898,131 @@ class App:
         self.running = on
         self.mode = mode if on else ""
         for it in self.items:
-            self.rows[it.id].set_locked(on, self.merge_var.get())
-        for b in (self.add_btn, self.addf_btn, self.clear_btn):
-            b.configure(state="disabled" if on else "normal")
+            self.rows[it.id].update_controls()
+        self.clear_btn.configure(state="disabled" if on else "normal")
         self.merge_chk.configure(state="disabled" if on else "normal")
+        power.keep_awake(bool(on))
         if on:
             self.start_btn.grid_forget()
             self.trial_btn.grid_forget()
-            self.cancel_btn.grid(row=0, column=3)
+            self.sched_btn.grid_forget()
+            self.cancel_btn.grid(row=0, column=4)
             self.cancel_btn.configure(state="normal", text="取消")
+            if mode == "batch" and not self.run_merge:
+                self.pause_after_var.set(False)
+                self.pause_btn.configure(text="暂停", state="normal", fg_color=C_WARN, hover_color=C_WARN_HOVER)
+                self.pause_btn.grid(row=0, column=3, padx=(0, 8))
+                self.pause_after_chk.grid(row=0, column=2, padx=(0, 12))
         else:
+            self.jump_item = None
+            self.run_merge = False
             self.cancel_btn.grid_forget()
-            self.trial_btn.grid(row=0, column=2, padx=(0, 8))
-            self.start_btn.grid(row=0, column=3)
+            self.pause_btn.grid_forget()
+            self.pause_after_chk.grid_forget()
+            self.sched_btn.grid(row=0, column=2, padx=(0, 8))
+            self.trial_btn.grid(row=0, column=3, padx=(0, 8))
+            self.start_btn.grid(row=0, column=4)
         self._refresh_summary()
 
     def _make_ctx(self):
         sv = dict(self.cfg.get("sv") or {})
+        opts = {"simplified": bool(self.asr_vars["asr_simplified"].get()), "tidy": bool(self.asr_vars["asr_tidy"].get()),
+                "split": bool(self.asr_vars["asr_split"].get())}
         return runner.Ctx(self.ffmpeg, self.ffprobe, lambda *a: self.q.put(a), self.tmp_dir,
                           low_priority=bool(self.low_var.get()), out_mode=self.cfg.get("out_mode", "folder"),
-                          out_custom=self.cfg.get("out_custom", ""), sv=sv)
+                          out_custom=self.cfg.get("out_custom", ""), sv=sv, data_dir=self.data_dir, asr_opts=opts)
 
-    def start(self):
-        diag.trail("点击 开始转换")
+    # ------------------------------------------------------------ 暂停 / 继续 / 先转
+    def item_paused(self, it):
+        c = self.ctx
+        return bool(self.running and self.mode == "batch" and c is not None and c.paused and
+                    it.status == "转换中" and it is not self.jump_item)
+
+    def can_jump(self, it):
+        c = self.ctx
+        return bool(self.running and self.mode == "batch" and not self.run_merge and c is not None and c.paused and
+                    self.jump_item is None and c.jump_thread is None and it.in_batch and it.status == "等待" and
+                    it.probe is not None)
+
+    def toggle_pause(self):
+        c = self.ctx
+        if not (self.running and self.mode == "batch" and c is not None):
+            return
+        if c.paused:
+            diag.trail("点击 继续")
+            c.resume()
+        else:
+            diag.trail("点击 暂停")
+            c.pause()
+
+    def pause_after_toggled(self):
+        v = bool(self.pause_after_var.get())
+        diag.trail("当前文件完成后暂停：%s" % ("开" if v else "关"))
+        if self.ctx is not None:
+            self.ctx.pause_after = v
+
+    def run_first(self, it):
+        diag.trail("点击 先转这个：%s" % it.name)
+        snap = self.run_snap
+        if not (self.ctx and runner.start_jump(self.ctx, it, lambda i: self.settings_for(i, snap))):
+            self.toast("现在不能先转这个文件", color=C_WARN)
+
+    def _apply_pause_ui(self, paused, reason=""):
+        if not self.running or self.mode != "batch":
+            return
+        if paused:
+            self.pause_btn.configure(text="继续", fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER)
+            if reason == "after":
+                self.pause_after_var.set(False)
+                self.toast("当前文件已完成，已暂停。点“继续”接着转下一个。", 8000, C_WARN)
+        else:
+            self.pause_btn.configure(text="暂停", fg_color=C_WARN, hover_color=C_WARN_HOVER)
+        power.keep_awake(not paused)
+        for it in self.items:
+            row = self.rows.get(it.id)
+            if row:
+                row.refresh()
+                row.update_controls()
+        self._update_total()
+
+    def _apply_lane(self, it, lane):
+        self.jump_item = it if lane == "jump" else None
+        if lane == "jump":
+            self.pause_btn.configure(text="先转中…", state="disabled")
+            self.toast("正在先转所选文件，转完会自动回到暂停的文件继续", 6000)
+        else:
+            self.pause_btn.configure(state="normal")
+        for i in self.items:
+            row = self.rows.get(i.id)
+            if row:
+                row.refresh()
+                row.update_controls()
+
+    def start(self, auto=False):
+        """auto=True 表示定时开始：没有人在场，所有需要确认的地方都按默认处理，不弹窗。"""
+        diag.trail("定时开始触发" if auto else "点击 开始转换")
         if self.running:
             return
+        if not auto:
+            self.cancel_sched(silent=True)
+
+        def warn(title, msg):
+            if auto:
+                self.toast(msg, 10000, C_WARN)
+                log.warning("定时开始被中止：%s", msg)
+            else:
+                messagebox.showwarning(title, msg, parent=self.root)
+
         if not (self.ffmpeg and self.ffprobe):
-            messagebox.showerror("缺少转换引擎", "找不到 ffmpeg。请确认程序文件夹里的 ffmpeg 文件夹完整。", parent=self.root)
+            if auto:
+                log.warning("定时开始被中止：缺少 ffmpeg")
+            else:
+                messagebox.showerror("缺少转换引擎", "找不到 ffmpeg。请确认程序文件夹里的 ffmpeg 文件夹完整。", parent=self.root)
             return
         todo = [i for i in self.items if i.probe and i.status in ("等待", "失败", "已取消")]
         if not todo:
             done_items = [i for i in self.items if i.probe and i.status == "完成"]
-            if done_items and messagebox.askyesno("重新转换", "列表里的文件都已转换完成。要全部再转换一次吗？", parent=self.root):
+            if (not auto) and done_items and messagebox.askyesno("重新转换", "列表里的文件都已转换完成。要全部再转换一次吗？", parent=self.root):
                 for i in done_items:
                     i.status, i.pct, i.message = "等待", 0, ""
                     self.rows[i.id].refresh()
@@ -830,11 +1036,13 @@ class App:
         # 检查：语音识别路径
         need_sv = (not merge and any(self.settings_for(i, snap)["target"] == "txt" for i in todo)) or (merge and snap["target"] == "txt")
         if need_sv and not self.sv_ready():
-            if messagebox.askyesno("还没设置 SenseVoice", "语音转文字需要先选择 SenseVoice 的程序和模型文件。现在去设置吗？", parent=self.root):
+            if auto:
+                warn("", "还没有设置 SenseVoice 路径，定时转换没有开始。")
+            elif messagebox.askyesno("还没设置 SenseVoice", "语音转文字需要先选择 SenseVoice 的程序和模型文件。现在去设置吗？", parent=self.root):
                 self.open_sv_dialog()
             return
         if merge and snap["target"] in ("txt", "srt", "gif"):
-            messagebox.showwarning("不能合并", "合并只支持常规视频或音频格式。请取消合并，或重新选择“转换成”。", parent=self.root)
+            warn("不能合并", "合并只支持常规视频或音频格式。请取消合并，或重新选择“转换成”。")
             return
         # 剪切时间等设置的合法性（提前发现）
         try:
@@ -843,34 +1051,41 @@ class App:
                 core.parse_time(s["trim_start"])
                 core.parse_time(s["trim_end"])
         except ValueError as e:
-            messagebox.showwarning("设置有误", str(e), parent=self.root)
+            warn("设置有误", str(e))
             return
         # 磁盘空间
-        first = todo[0]
-        d = core.out_dir_for(first.path, self.cfg.get("out_mode", "folder"), self.cfg.get("out_custom", ""))
-        total_in = sum(i.probe.size for i in todo)
-        free, ok = runner.check_space(d, 1024 ** 3)
-        if free is not None and (free < 1024 ** 3 or free < total_in):
-            if not messagebox.askyesno("磁盘空间可能不够", "保存位置所在磁盘剩余 %s，待转换文件共 %s。\n空间不足会导致转换失败，仍要继续吗？" %
-                                       (core.human_size(free), core.human_size(total_in)), parent=self.root):
-                return
+        if not auto:
+            first = todo[0]
+            d = core.out_dir_for(first.path, self.cfg.get("out_mode", "folder"), self.cfg.get("out_custom", ""))
+            total_in = sum(i.probe.size for i in todo)
+            free, ok = runner.check_space(d, 1024 ** 3)
+            if free is not None and (free < 1024 ** 3 or free < total_in):
+                if not messagebox.askyesno("磁盘空间可能不够", "保存位置所在磁盘剩余 %s，待转换文件共 %s。\n空间不足会导致转换失败，仍要继续吗？" %
+                                           (core.human_size(free), core.human_size(total_in)), parent=self.root):
+                    return
+        self.run_merge = merge
+        self.run_snap = snap
         self.ctx = self._make_ctx()
-        self.batch_items = todo
+        for i in self.items:
+            i.in_batch = False
+            i.snap = None            # 每次点“开始”，都以当前界面设置为准
         for i in todo:
-            i.status, i.pct, i.message, i.elapsed, i.out_paths = "等待", 0, "", None, []
+            i.in_batch = True
+            i.status, i.pct, i.message, i.elapsed, i.out_paths, i.eta, i.approx = "等待", 0, "", None, [], None, False
             self.rows[i.id].refresh()
         self.last_outs = []
         self.total_bar.set(0)
         self._set_running(True, "batch")
-        log.info("开始批量转换：%d 个文件，合并=%s，目标=%s", len(todo), merge, snap["target"])
+        log.info("开始批量转换：%d 个文件，合并=%s，目标=%s，定时=%s", len(todo), merge, snap["target"], auto)
         threading.Thread(target=runner.run_batch, name="转换线程", daemon=True,
-                         args=(self.ctx, todo, lambda it: self.settings_for(it, snap), merge, snap)).start()
+                         args=(self.ctx, self.items, lambda it: self.settings_for(it, snap), merge, snap)).start()
 
     def cancel(self):
         diag.trail("点击 取消")
         if self.ctx:
-            self.ctx.cancel.set()
+            self.ctx.request_cancel()
         self.cancel_btn.configure(state="disabled", text="正在取消…")
+        self.pause_btn.configure(state="disabled")
 
     def trial(self):
         diag.trail("点击 试转前30秒")
@@ -897,6 +1112,7 @@ class App:
         except ValueError as e:
             messagebox.showwarning("设置有误", str(e), parent=self.root)
             return
+        self.run_merge = False
         self.ctx = self._make_ctx()
         it.prev_status = it.status
         it.status, it.pct, it.message = "转换中", 0, "试转前 30 秒…"
@@ -916,6 +1132,100 @@ class App:
                 diag.record_error("试转", *sys.exc_info())
                 self.q.put(("trial_done", it, None, "程序内部错误：%s，请复制诊断报告发给我。" % e))
         threading.Thread(target=work, name="试转线程", daemon=True).start()
+
+    # ------------------------------------------------------------ 定时开始
+    def _sched_text(self):
+        d = self.sched_at
+        today = datetime.date.today()
+        day = "" if d.date() == today else ("明天 " if d.date() == today + datetime.timedelta(days=1) else d.strftime("%m-%d "))
+        return day + d.strftime("%H:%M")
+
+    def sched_clicked(self):
+        if self.sched_at is not None:
+            self.cancel_sched()
+        else:
+            self.open_sched_dialog()
+
+    def open_sched_dialog(self):
+        diag.trail("点击 定时开始")
+        if self.running:
+            return
+        todo = [i for i in self.items if i.probe and i.status in ("等待", "失败", "已取消")]
+        if not todo:
+            self.toast("请先添加要转换的文件", color=C_WARN)
+            return
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("定时开始")
+        center_on(dlg, self.root, 420, 290)
+        dlg.after(150, lambda: (dlg.lift(), dlg.focus_force()))
+        ctk.CTkLabel(dlg, text="几点自动开始转换？", font=F(15, True), anchor="w").pack(fill="x", padx=22, pady=(20, 8))
+        row = ctk.CTkFrame(dlg, fg_color="transparent")
+        row.pack(fill="x", padx=22)
+        base = datetime.datetime.now() + datetime.timedelta(hours=1)
+        hv = tk.StringVar(value="%02d" % base.hour)
+        mv = tk.StringVar(value="%02d" % (base.minute // 5 * 5))
+        ctk.CTkOptionMenu(row, values=["%02d" % h for h in range(24)], variable=hv, width=76, font=F(14)).pack(side="left")
+        ctk.CTkLabel(row, text=" 时 ", font=F(14)).pack(side="left")
+        ctk.CTkOptionMenu(row, values=["%02d" % m for m in range(0, 60, 5)], variable=mv, width=76, font=F(14)).pack(side="left")
+        ctk.CTkLabel(row, text=" 分", font=F(14)).pack(side="left")
+        ctk.CTkLabel(dlg, text="到点后会自动开始。请保持电脑开机、本软件开着（等待期间软件会阻止电脑自动睡眠）。"
+                               "如果勾选了“全部完成后自动关机”，转完会自动关机。",
+                     font=F(12), text_color=C_MUTED, anchor="w", justify="left", wraplength=370).pack(fill="x", padx=22, pady=(14, 0))
+        bar = ctk.CTkFrame(dlg, fg_color="transparent")
+        bar.pack(side="bottom", fill="x", padx=22, pady=(0, 18))
+
+        def ok():
+            now = datetime.datetime.now()
+            t = now.replace(hour=int(hv.get()), minute=int(mv.get()), second=0, microsecond=0)
+            if t <= now:
+                t += datetime.timedelta(days=1)
+            self.sched_at = t
+            self.sched_btn.configure(text="取消定时")
+            power.keep_awake(True)
+            diag.trail("设定定时开始：%s" % self._sched_text())
+            log.info("设定定时开始：%s", t.strftime("%Y-%m-%d %H:%M"))
+            dlg.destroy()
+            self._refresh_summary()
+            self.toast("已定时：%s 自动开始" % self._sched_text(), 6000)
+            self._sched_tick()
+
+        ctk.CTkButton(bar, text="确定", width=80, font=F(13, True), command=ok).pack(side="right")
+        ctk.CTkButton(bar, text="取消", width=70, font=F(13), fg_color="transparent", border_width=1,
+                      text_color=("gray20", "gray85"), command=dlg.destroy).pack(side="right", padx=8)
+        try:
+            dlg.after(300, dlg.grab_set)
+        except Exception:
+            pass
+
+    def _sched_tick(self):
+        self._sched_job = None
+        if self.sched_at is None or self.running:
+            return
+        if datetime.datetime.now() >= self.sched_at:
+            self.sched_at = None
+            self.sched_btn.configure(text="定时开始")
+            power.keep_awake(False)
+            self.start(auto=True)
+            return
+        self._sched_job = self.root.after(1000, self._sched_tick)
+
+    def cancel_sched(self, silent=False):
+        if self.sched_at is None:
+            return
+        diag.trail("取消定时开始")
+        self.sched_at = None
+        if self._sched_job:
+            try:
+                self.root.after_cancel(self._sched_job)
+            except Exception:
+                pass
+            self._sched_job = None
+        self.sched_btn.configure(text="定时开始")
+        if not self.running:
+            power.keep_awake(False)
+        self._refresh_summary()
+        if not silent:
+            self.toast("已取消定时")
 
     # ------------------------------------------------------------ 事件处理
     def _pump(self):
@@ -942,14 +1252,16 @@ class App:
             row = self.rows.get(it.id)
             if row:
                 row.refresh()
+                row.update_controls()
             self.panel._schedule_preview()
             self._refresh_summary()
+            self.save_queue_soon()
         elif k == "progress":
             _, it, pct, text = ev
             it.pct, it.message = pct, text
             row = self.rows.get(it.id)
-            if row and it.status == "转换中":
-                row.set_progress(pct)
+            if row and it.status == "转换中" and not self.item_paused(it):
+                row.set_progress(pct, it.approx)
                 row.msg.configure(text=text, text_color=C_MUTED)
                 row.msg.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(6, 6), pady=(0, 8))
             self._update_total()
@@ -961,8 +1273,14 @@ class App:
             row = self.rows.get(it.id)
             if row:
                 row.refresh()
+                row.update_controls()
             self._update_total()
             self._refresh_summary()
+            self.save_queue_soon()
+        elif k == "pause_state":
+            self._apply_pause_ui(bool(ev[2]), ev[3])
+        elif k == "lane":
+            self._apply_lane(ev[1], ev[2])
         elif k == "batch_done":
             self._batch_done(ev[2])
         elif k == "trial_done":
@@ -976,28 +1294,59 @@ class App:
         elif k == "crash":
             messagebox.showerror("程序出错了", "程序遇到了意外错误。\n诊断报告已自动保存到：\n%s\n\n请把这个文件的内容（或点右上角橙色“复制诊断报告”）发给我。" % ev[1], parent=self.root)
 
+    def _batch_list(self):
+        return [i for i in self.items if i.in_batch and i.status != "无法读取"]
+
     def _update_total(self):
-        items = self.batch_items if self.mode == "batch" else []
+        if not (self.running and self.mode == "batch"):
+            return
+        items = self._batch_list()
         if not items:
             return
         n = len(items)
         done = sum(1 for i in items if i.status in ("完成", "失败", "已取消"))
         running = [i for i in items if i.status == "转换中"]
-        if self.merge_var.get() and n >= 2:
+        if self.run_merge and n >= 2:
             val = max((i.pct or 0) for i in running) / 100.0 if running else (1.0 if done == n else 0.0)
         else:
-            val = (done + sum((i.pct or 0) / 100.0 for i in running)) / n
-        self.total_bar.set(max(0.0, min(1.0, val)))
+            wsum = psum = 0.0
+            for i in items:
+                w = float(i.probe.duration) if (i.probe and i.probe.duration) else 60.0
+                p = 1.0 if i.status in ("完成", "失败", "已取消") else ((i.pct or 0) / 100.0 if i.status == "转换中" else 0.0)
+                wsum += w
+                psum += w * p
+            val = psum / wsum if wsum else 0.0
+        val = max(0.0, min(1.0, val))
+        self.total_bar.set(val)
+        self._total_pct = val * 100.0
+        self._total_eta = None
+        if self.ctx is not None and not self.run_merge:
+            snap = self.run_snap
+            try:
+                self._total_eta = runner.estimate_remaining(self.ctx, self.items, lambda i: self.settings_for(i, snap))
+            except Exception:
+                self._total_eta = None
         self._refresh_summary()
 
     def _refresh_summary(self):
         n = len(self.items)
         if self.running and self.mode == "batch":
-            its = self.batch_items
+            its = self._batch_list()
             done = sum(1 for i in its if i.status in ("完成", "失败", "已取消"))
-            self.sum_lbl.configure(text="转换中：%d / %d" % (min(done + 1, len(its)), len(its)))
+            pct = getattr(self, "_total_pct", 0.0)
+            parts = []
+            if self.ctx is not None and self.ctx.paused:
+                parts.append("已暂停")
+            parts.append("总进度 %d%%" % int(pct))
+            parts.append("第 %d/%d 个" % (min(done + 1, len(its)), len(its)))
+            eta = getattr(self, "_total_eta", None)
+            if eta is not None and not (self.ctx is not None and self.ctx.paused):
+                parts.append("剩余约 %s（估算）" % core.fmt_hms(eta))
+            self.sum_lbl.configure(text=" · ".join(parts))
         elif self.running:
             self.sum_lbl.configure(text="试转中…")
+        elif self.sched_at is not None:
+            self.sum_lbl.configure(text="⏰ 将在 %s 自动开始" % self._sched_text())
         else:
             ok = sum(1 for i in self.items if i.status == "完成")
             bad = sum(1 for i in self.items if i.status in ("失败", "无法读取"))
@@ -1011,18 +1360,25 @@ class App:
     def _batch_done(self, stats):
         log.info("批量转换结束：%s", {k: v for k, v in stats.items() if k != "outs"})
         self._set_running(False)
+        self._total_eta = None
         self.last_outs = stats.get("outs", [])
         ok, bad, canc = stats.get("ok", 0), stats.get("fail", 0), stats.get("cancel", 0)
         if not canc and ok and not bad:
             self.total_bar.set(1.0)
+        leftover = [i for i in self.items if i.in_batch and i.status == "等待" and i.probe is not None]
         for it in self.items:
+            it.in_batch = False
             if it.id in self.rows:
                 self.rows[it.id].refresh()
+                self.rows[it.id].update_controls()
         self._refresh_summary()
+        self.save_queue_soon()
         try:
             self.root.bell()
         except Exception:
             pass
+        if leftover:
+            self.toast("刚加进来的 %d 个文件还没转，请再点“开始转换”。" % len(leftover), 9000, C_WARN)
         if canc:
             self.toast("已取消。未完成的文件已恢复为“已取消”，可再次点“开始转换”。", 6000, C_WARN)
             return
@@ -1142,6 +1498,27 @@ class App:
         c["user_presets"] = "%d 个" % len(self.user_presets)
         return json.dumps(c, ensure_ascii=False, indent=1)
 
+    def _run_text(self):
+        c = self.ctx
+        lines = ["暂停=%s；完成后暂停=%s；先转中=%s；定时=%s；防睡眠=%s；排队中的追加文件=%d" % (
+            bool(c and c.paused), bool(c and c.pause_after), self.jump_item.name if self.jump_item else "-",
+            self._sched_text() if self.sched_at else "-", power.is_on(),
+            sum(1 for i in self.items if i.snap and i.status in ("等待", "探测中")))]
+        if c:
+            lines.append("本轮已测得速度（处理 1 秒内容要几秒）：%s" % {k: round(v, 3) for k, v in c.rates.items()})
+        try:
+            lines.append("已记住的识别速度：%.3f" % runner.load_rtf(c or runner.Ctx(None, None, None, self.tmp_dir, data_dir=self.data_dir)))
+        except Exception:
+            pass
+        try:
+            rd = os.path.join(self.data_dir, "resume")
+            lines.append("未完成的识别续转记录：%d 个" % (len(os.listdir(rd)) if os.path.isdir(rd) else 0))
+        except Exception:
+            pass
+        lines.append("最近一次识别输出的格式特征（不含内容）：%s" % (runner.LAST_ASR_STATS or "（还没有）"))
+        lines.append("文字整理选项：%s" % {k: bool(v.get()) for k, v in getattr(self, "asr_vars", {}).items()})
+        return "\n".join(lines)
+
     def _items_text(self):
         if not self.items:
             return "（空）"
@@ -1149,13 +1526,15 @@ class App:
 
     def on_close(self):
         if self.running:
-            if not messagebox.askyesno("正在转换", "还有转换正在进行，确定要退出吗？未完成的文件会丢弃。", parent=self.root):
+            if not messagebox.askyesno("正在转换", "还有转换正在进行，确定要退出吗？\n语音转文字已识别完的段落会保留，下次可以接着转；其他格式需要重新转。", parent=self.root):
                 return
             if self.ctx:
-                self.ctx.cancel.set()
+                self.ctx.request_cancel()
             time.sleep(0.4)
         try:
             self._save_cfg()
+            self._save_queue()
+            power.keep_awake(False)
         except Exception:
             pass
         self._clean_tmp()
